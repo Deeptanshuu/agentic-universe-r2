@@ -73,10 +73,11 @@ class Incidents:
                              (wf.id, prompt, frm))
         n, x = n or 0, x or 0
         base = self.baseline(wf.id)
-        if n < S.HAL_MIN_CONN or x < S.HAL_MIN_EVENTS:
+        watch = self.ctl.supervisor_touched(wf.id, "prompt_version", hb, hours=12)
+        min_n, min_x = (S.HAL_WATCH_MIN_CONN, S.HAL_WATCH_MIN_EVENTS) if watch else (S.HAL_MIN_CONN, S.HAL_MIN_EVENTS)
+        if n < min_n or x < min_x:
             return
         z = excess_rate_z(x, n, base)
-        watch = self.ctl.supervisor_touched(wf.id, "prompt_version", hb, hours=12)
         zc = S.Z_HAL_WATCH if watch else S.Z_HAL
         if x / n >= S.HAL_RATIO * base and z >= zc:
             detail = {"stage": "detected", "bad_prompt": prompt, "rate": round(x / n, 4), "baseline": round(base, 4),

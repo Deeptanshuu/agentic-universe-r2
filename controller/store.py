@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS scopes(
 CREATE TABLE IF NOT EXISTS cohorts(wf TEXT, cohort_id TEXT, where_json TEXT, feature TEXT, value TEXT,
   status TEXT, created_sim TEXT, reason TEXT, PRIMARY KEY(wf, cohort_id));
 
+-- caller-ID rotation pool state per DID: candidate | probing | active | flagged
+CREATE TABLE IF NOT EXISTS dids(wf TEXT, did TEXT, state TEXT, since_hb INTEGER, detail TEXT,
+  introduced_hb INTEGER, PRIMARY KEY(wf, did));
+
 CREATE TABLE IF NOT EXISTS incidents(
   id INTEGER PRIMARY KEY AUTOINCREMENT, wf TEXT, kind TEXT, key TEXT, status TEXT,
   opened_sim TEXT, opened_hb INTEGER, resolved_sim TEXT, detail TEXT);

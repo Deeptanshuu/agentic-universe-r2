@@ -46,6 +46,7 @@ class Experiments:
     def __init__(self, ctl):
         self.ctl = ctl
         self.store = ctl.store
+        self._logging = True
 
     # ------------------------------------------------------------------ scope bookkeeping
     def ensure_scopes(self, wf: WF, cfg: dict, hb: int) -> None:
@@ -73,7 +74,7 @@ class Experiments:
 
     # ------------------------------------------------------------------ desired allocation per mode
     def allowed_arms(self, wf: WF, dim: str, excluded: list[str]) -> list[str]:
-        bad = set(excluded) | (self.ctl.health.excluded(wf.id) if dim == "caller_id" else set())
+        bad = set(excluded)
         return [o for o in wf.options.get(dim, []) if o not in bad]
 
     def dist_for(self, wf: WF, dim: str, mode: str, champion: str | None, incumbent: str | None,
@@ -103,6 +104,14 @@ class Experiments:
         ok = not (c.diff < -gmax or (c.z <= -2.33 and c.diff < -gmax / 2))
         return ok, {"guardrail": gm, "max_drop": gmax, **c.as_dict()}
 
+    def _still_ahead(self, wf: WF, sc: Scope, cohorts: list[str], a: str, b: str, hb: int) -> tuple[bool, dict]:
+        """Effects decay. Before promoting `a` over `b`, require a to still be ahead in the last RECENT_H
+        hours (point estimate > 0) whenever that window has enough data to say anything."""
+        r = arm_data(self.store, wf.id, sc.dim, "all", hb - S.RECENT_H, cohorts=cohorts).cmp(a, b, wf.primary)
+        if r.n_a < S.RECENT_MIN_N[wf.primary] or r.n_b < S.RECENT_MIN_N[wf.primary]:
+            return True, {"recent": r.as_dict(), "recent_check": "insufficient data, not applied"}
+        return r.diff > 0, {"recent": r.as_dict()}
+
     def evaluate(self, wf: WF, sc: Scope, cfg: dict, hb: int) -> list[dict]:
         metric = wf.primary
         cohorts = self.analysis_cohorts(wf.id, sc.cohort, sc.dim, cfg)
@@ -119,8 +128,9 @@ class Experiments:
             if hb - (sc.mode_since_hb or hb) < S.SUPERVISOR_PAUSE_H:
                 return []
             inc = majority(live) or sc.incumbent
-            return [{**base, "mode": "explore", "incumbent": inc, "champion": inc,
-                     "reason": f"supervisor pause over; resume exploration around supervisor's choice {inc}"}]
+            return [{**base, "mode": "exploit", "incumbent": inc, "champion": inc,
+                     "reason": f"supervisor pause over; keep the supervisor's choice {inc} as champion and add a "
+                               f"{S.EXPLOIT_HOLDBACK:.0%} holdback so we keep measuring the alternatives"}]
 
         if sc.mode == "explore":
             start = sc.explore_from_hb if sc.explore_from_hb is not None else hb
@@ -136,7 +146,9 @@ class Experiments:
                 if enough[a] and res[a].z >= S.Z_WIN:
                     ok, g = self._guard_ok(wf, data, a, inc)
                     ev[a]["guardrail_check"] = g
-                    if ok:
+                    fresh, rc = self._still_ahead(wf, sc, cohorts, a, inc, hb)
+                    ev[a]["recency_check"] = rc
+                    if ok and fresh:
                         winners.append(a)
             if winners:
                 w = max(winners, key=lambda a: (round(res[a].lcb(), 6), a))
@@ -148,16 +160,45 @@ class Experiments:
             maxed = arms and all(res[a].n_a >= S.EXPLORE_MAX_N[metric] for a in arms)
             timed_out = (hb - start) >= S.MAX_EXPLORE_HOURS and all(enough.values())
             if maxed or timed_out:
-                t = {**base, "mode": "exploit", "champion": inc,
-                     "reason": f"no challenger significantly beat {inc} on {metric} "
-                               f"({'sample cap reached' if maxed else 'time cap reached'}); keep incumbent",
-                     "evidence": {"metric": metric, "vs_incumbent": ev, "window_from_hb": start}}
-                return [t] + self.segment_overrides(wf, sc, cfg, inc, inc, start, metric)
+                # Final look. (1) Holm step-down at alpha=0.05 over the remaining challengers: the leader must
+                # clear z_(alpha/m). (2) Otherwise the "lean" rule: at the sample cap every arm is within the
+                # MDE of the incumbent, so we take the leader only if P(better) >= 0.8 and the guardrail holds;
+                # the exploit holdback keeps policing it. (3) Otherwise keep the incumbent.
+                m = max(1, len(arms))
+                zf = S.z_final(m)
+                ranked = sorted(arms, key=lambda a: (-res[a].z, a))
+                pick, rule = inc, "keep incumbent"
+                for a in ranked:
+                    ok, g = self._guard_ok(wf, data, a, inc)
+                    fresh, rc = self._still_ahead(wf, sc, cohorts, a, inc, hb)
+                    ev[a]["recency_check"] = rc
+                    if not ok or not fresh:
+                        continue
+                    if res[a].z >= zf:
+                        pick, rule = a, f"final-look Holm winner (z={res[a].z:.2f} >= {zf:.2f})"
+                    elif res[a].z >= S.Z_LEAN:
+                        pick, rule = a, (f"no significant winner; leader {a} chosen with P(better)>="
+                                         f"{S.P_LEAN:.0%} (z={res[a].z:.2f}), holdback will police it")
+                    break
+                t = {**base, "mode": "exploit", "champion": pick,
+                     "reason": f"{'sample' if maxed else 'time'} cap reached on {metric}: {rule}",
+                     "evidence": {"metric": metric, "vs_incumbent": ev, "window_from_hb": start, "final_look": True}}
+                return [t] + self.segment_overrides(wf, sc, cfg, pick, inc, start, metric)
             losers = [a for a in arms if enough[a] and res[a].z <= -S.Z_LOSE]
+            # recency harm-stop: an arm that has turned significantly worse lately (decay) stops too, even if
+            # its earlier good days still prop up the full-window average
+            recent = arm_data(self.store, wf.id, sc.dim, "all", hb - S.RECENT_LOSE_H, cohorts=cohorts)
+            for a in arms:
+                r = recent.cmp(a, inc, metric)
+                if a not in losers and r.n_a >= S.RECENT_MIN_N[metric] and r.z <= -S.Z_LOSE:
+                    losers.append(a)
+                    ev[a]["recent_harm"] = r.as_dict()
             if losers:
                 return [{**base, "mode": "explore", "excluded": sorted(set(sc.excluded) | set(losers)),
                          "reason": f"stop exposing {', '.join(losers)}: significantly worse than {inc} on {metric}",
                          "evidence": {"metric": metric, "vs_incumbent": ev}}]
+            self._log_look(wf, sc, "explore: no decision yet", {"metric": metric, "incumbent": inc,
+                                                                 "n_incumbent": n_inc, "vs_incumbent": ev})
             return []
 
         if sc.mode == "exploit":
@@ -176,27 +217,37 @@ class Experiments:
         ev = {"trailing_from_hb": trail_from, "champion_vs_holdback": pool.as_dict()}
         decayed = pool.n_b >= S.MIN_CTRL_DECAY[metric] and pool.z <= -S.Z_DECAY
         why = f"champion {c} now significantly worse than holdback arms (z={pool.z:.2f})"
-        if not decayed and sc.explore_from_hb is not None and sc.mode_since_hb is not None:
-            # difference-in-differences: champion's own rate vs the window that promoted it, net of drift
+        if (not decayed and not wf.next_campaign_only and sc.explore_from_hb is not None
+                and sc.mode_since_hb is not None):
+            # Self-decline check: the champion's own rate now vs the window that promoted it. Requires
+            # (i) a big, significant drop on the champion's own (large) sample and (ii) that the drop is not
+            # explained by drift seen on the holdback arms (combined variance of both). Disabled for
+            # next_campaign_only workflows, whose campaign-age mix shifts after every change and would
+            # confound a before/after comparison.
             ref = arm_data(self.store, wf.id, sc.dim, "all", sc.explore_from_hb, hb_to=sc.mode_since_hb,
                            cohorts=cohorts)
             now_c, ref_c = data.rate(c, metric), ref.rate(c, metric)
             n_now, n_ref = data.trials(c, metric), ref.trials(c, metric)
             if None not in (now_c, ref_c) and n_now >= S.MIN_N[metric] and n_ref >= S.MIN_N[metric]:
-                drift = 0.0
-                tot_now = sum(data.trials(o, metric) for o in others)
-                tot_ref = sum(ref.trials(o, metric) for o in others)
-                if tot_now >= S.MIN_CTRL_DECAY[metric] and tot_ref >= S.MIN_CTRL_DECAY[metric]:
-                    o_now = sum((data.rate(o, metric) or 0) * data.trials(o, metric) for o in others) / tot_now
-                    o_ref = sum((ref.rate(o, metric) or 0) * ref.trials(o, metric) for o in others) / tot_ref
-                    drift = o_now - o_ref
-                did = (now_c - ref_c) - drift
-                se = (now_c * (1 - now_c) / n_now + ref_c * (1 - ref_c) / n_ref) ** 0.5 or 1e-9
-                ev["did"] = {"champion_now": round(now_c, 4), "champion_ref": round(ref_c, 4),
-                             "control_drift": round(drift, 4), "did": round(did, 4), "z": round(did / se, 2)}
-                if did <= -S.DID_MIN_DROP and did / se <= -S.Z_DID:
+                self_drop = now_c - ref_c
+                se_self = (now_c * (1 - now_c) / n_now + ref_c * (1 - ref_c) / n_ref) ** 0.5 or 1e-9
+                tn = sum(data.trials(o, metric) for o in others)
+                tr = sum(ref.trials(o, metric) for o in others)
+                ctrl_drop, se_ctrl = 0.0, 0.25
+                if tn > 0 and tr > 0:
+                    o_now = sum((data.rate(o, metric) or 0) * data.trials(o, metric) for o in others) / tn
+                    o_ref = sum((ref.rate(o, metric) or 0) * ref.trials(o, metric) for o in others) / tr
+                    ctrl_drop = o_now - o_ref
+                    se_ctrl = (o_now * (1 - o_now) / tn + o_ref * (1 - o_ref) / tr) ** 0.5
+                did = self_drop - ctrl_drop
+                z_did = did / ((se_self ** 2 + se_ctrl ** 2) ** 0.5 or 1e-9)
+                ev["self_decline"] = {"champion_now": round(now_c, 4), "champion_ref": round(ref_c, 4),
+                                      "z_self": round(self_drop / se_self, 2), "control_drift": round(ctrl_drop, 4),
+                                      "did": round(did, 4), "z_did": round(z_did, 2), "n_now": n_now, "n_ref": n_ref}
+                if self_drop <= -S.DID_MIN_DROP and self_drop / se_self <= -S.Z_DID and z_did <= -S.Z_DID_CTRL:
                     decayed = True
-                    why = f"champion {c} fell {did:+.3f} vs its promotion window net of control drift"
+                    why = (f"champion {c} fell {self_drop:+.3f} vs its promotion window (z={self_drop / se_self:.1f}); "
+                           f"not explained by holdback drift {ctrl_drop:+.3f} (z={z_did:.1f})")
         if decayed:
             back = sc.incumbent if (sc.incumbent and sc.incumbent != c) else None
             if back is None:
@@ -205,6 +256,15 @@ class Experiments:
             return [{**base, "mode": "explore", "incumbent": back, "champion": back,
                      "excluded": sorted(set(sc.excluded) | {c}), "rollback": True,
                      "reason": f"DECAY: {why}; roll back to {back} and re-explore", "evidence": ev}]
+        # a holdback arm that has turned significantly worse than the champion lately: stop exposing it
+        recent = arm_data(self.store, wf.id, sc.dim, "all", hb - S.RECENT_LOSE_H, cohorts=cohorts)
+        bad = [o for o in others if recent.cmp(o, c, metric).n_a >= S.RECENT_MIN_N[metric]
+               and recent.cmp(o, c, metric).z <= -S.Z_LOSE]
+        if bad:
+            return [{**base, "mode": "exploit", "excluded": sorted(set(sc.excluded) | set(bad)),
+                     "reason": f"stop holdback arm(s) {', '.join(bad)}: significantly worse than champion {c} over "
+                               f"the last {S.RECENT_LOSE_H}h", "evidence": {o: recent.cmp(o, c, metric).as_dict()
+                                                                          for o in bad}}]
         # a holdback arm that has since become significantly better than the champion
         since = arm_data(self.store, wf.id, sc.dim, "all", sc.mode_since_hb or 0, cohorts=cohorts)
         best = None
@@ -212,14 +272,52 @@ class Experiments:
             r = since.cmp(o, c, metric)
             if r.n_a >= S.MIN_N[metric] and r.n_b >= S.MIN_N[metric] and r.z >= S.Z_WIN:
                 ok, _ = self._guard_ok(wf, since, o, c)
-                if ok and (best is None or r.lcb() > best[1].lcb()):
+                fresh, _ = self._still_ahead(wf, sc, cohorts, o, c, hb)
+                if ok and fresh and (best is None or r.lcb() > best[1].lcb()):
                     best = (o, r)
         if best:
             o, r = best
             return [{**base, "mode": "exploit", "champion": o, "incumbent": c,
                      "reason": f"holdback arm {o} now beats champion {c} (z={r.z:.2f})",
                      "evidence": {"vs_champion": r.as_dict()}}]
+        self._log_look(wf, sc, f"exploit: champion {c} holding (vs holdback z={pool.z:.2f})", ev)
         return []
+
+    def _log_look(self, wf: WF, sc: Scope, summary: str, ev: dict) -> None:
+        if not self._logging:
+            return
+        self.store.decide(wf.id, "look", f"{sc.key}: {summary}", ev)
+
+    # ------------------------------------------------------------------ hourly decay watch (urgent)
+    def decay_watch(self, wf: WF, hb: int) -> None:
+        """Rollbacks don't wait for the next look: a decaying champion is harm in progress."""
+        if self.ctl.gov.inflight(wf.id):
+            return
+        scopes = [s for s in self.scopes(wf.id) if s.mode == "exploit"]
+        if not scopes:
+            return
+        cfg = self.ctl.live_config(wf.id)["config"]
+        self._logging = False
+        try:
+            ts = []
+            for sc in scopes:
+                cohorts = self.analysis_cohorts(wf.id, sc.cohort, sc.dim, cfg)
+                base = {"wf": wf.id, "cohort": sc.cohort, "dim": sc.dim, "champion": sc.champion,
+                        "incumbent": sc.incumbent, "excluded": list(sc.excluded)}
+                ts += [t for t in self._check_decay(wf, sc, cfg, hb, cohorts, base) if t.get("rollback")]
+        finally:
+            self._logging = True
+        if not ts:
+            return
+        new = clone(cfg)
+        for t in ts:
+            d = self.dist_for(wf, t["dim"], t["mode"], t["champion"], t["incumbent"], t["excluded"])
+            if d:
+                set_dist(new, t["cohort"], t["dim"], d)
+        for t in ts:
+            self.store.decide(wf.id, "experiment_eval", t["reason"], t.get("evidence"))
+        pkg = self.package(wf, cfg, new, ts, hb)
+        self.ctl.gov.submit(wf, kind="experiment", new_cfg=new, plan={"transitions": ts}, urgent=True, **pkg)
 
     def segment_overrides(self, wf: WF, sc: Scope, cfg: dict, chosen: str, inc: str, start: int,
                           metric: str) -> list[dict]:

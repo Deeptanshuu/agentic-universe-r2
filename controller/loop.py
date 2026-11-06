@@ -124,6 +124,7 @@ class Controller:
         with self.store.tx():
             for w in self.wfs.values():
                 self.exp.ensure_scopes(w, self.live_config(w.id)["config"], self.hb)
+                self.health.ensure(w, self.live_config(w.id)["config"], self.hb)
                 self.inc.baseline(w.id)
 
     # ------------------------------------------------------------------ helpers used by modules
@@ -253,14 +254,18 @@ class Controller:
         tick_hour = ((self.minute - 1) // 60) % 24
         dialling = any(w.window[0] <= tick_hour < w.window[1] for w in self.wfs.values())
         self.gov.tick()
-        self.health.tick(self.hb, dialling)
+        look = self.minute % 60 == 0 and self.hour in S.LOOK_HOURS
+        self.health.tick(self.hb, dialling, look)
         self.inc.tick(self.hb, dialling)
-        if self.minute % 60 == 0 and self.hour in S.LOOK_HOURS:
+        if self.minute % 60 == 0:
             for w in self.wfs.values():
                 try:
-                    self.exp.look(w, self.hb)
+                    if self.hour in S.LOOK_HOURS:
+                        self.exp.look(w, self.hb)
+                    elif w.approver_hours[0] <= self.hour < w.approver_hours[1]:
+                        self.exp.decay_watch(w, self.hb)
                 except ApiError as e:
-                    log(f"look {w.id} failed: {e}")
+                    log(f"experiment step {w.id} failed: {e}")
         self.housekeeping()
         rss = _rss_mb()
         with self.store.tx():

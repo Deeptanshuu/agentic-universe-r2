@@ -72,10 +72,11 @@ class WF:
         return float(self.gov.get("min_validation_pass_rate", 0.97))
 
     def experiment_dims(self) -> list[str]:
-        """Levers that move this workflow's PRIMARY KPI. Engagement is moved by how the agent shows up
-        (welcome, voice); pickup is moved by who is calling (caller ID). We don't run experiments on dims
-        that only touch the guardrail."""
-        dims = ["welcome_message", "voice"] if self.primary == "engagement_rate" else ["caller_id"]
+        """Variant experiments target levers that move this workflow's PRIMARY KPI. Engagement is moved by
+        how the agent shows up (welcome, voice). Pickup is moved by who is calling — caller ID — which is
+        managed by the rotation pool in health.py (a fatigable resource, not a variant to crown a winner
+        for). We don't run variant experiments on dims that only touch the guardrail."""
+        dims = ["welcome_message", "voice"] if self.primary == "engagement_rate" else []
         return [d for d in dims if len(self.options.get(d, [])) > 1]
 
     def auto_allowed(self, dims: set[str]) -> bool:
