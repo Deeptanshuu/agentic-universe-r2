@@ -233,8 +233,9 @@ class Experiments:
                 se_self = (now_c * (1 - now_c) / n_now + ref_c * (1 - ref_c) / n_ref) ** 0.5 or 1e-9
                 tn = sum(data.trials(o, metric) for o in others)
                 tr = sum(ref.trials(o, metric) for o in others)
-                ctrl_drop, se_ctrl = 0.0, 0.25
-                if tn > 0 and tr > 0:
+                ctrl_drop, se_ctrl = 0.0, 0.0  # no control: self-only test at a stricter bar (below)
+                has_ctrl = tn > 0 and tr > 0
+                if has_ctrl:
                     o_now = sum((data.rate(o, metric) or 0) * data.trials(o, metric) for o in others) / tn
                     o_ref = sum((ref.rate(o, metric) or 0) * ref.trials(o, metric) for o in others) / tr
                     ctrl_drop = o_now - o_ref
@@ -244,27 +245,40 @@ class Experiments:
                 ev["self_decline"] = {"champion_now": round(now_c, 4), "champion_ref": round(ref_c, 4),
                                       "z_self": round(self_drop / se_self, 2), "control_drift": round(ctrl_drop, 4),
                                       "did": round(did, 4), "z_did": round(z_did, 2), "n_now": n_now, "n_ref": n_ref}
-                if self_drop <= -S.DID_MIN_DROP and self_drop / se_self <= -S.Z_DID and z_did <= -S.Z_DID_CTRL:
+                ctrl_ok = (z_did <= -S.Z_DID_CTRL) if has_ctrl else (self_drop / se_self <= -(S.Z_DID + 0.5))
+                ev["self_decline"]["control_available"] = has_ctrl
+                if self_drop <= -S.DID_MIN_DROP and self_drop / se_self <= -S.Z_DID and ctrl_ok:
                     decayed = True
                     why = (f"champion {c} fell {self_drop:+.3f} vs its promotion window (z={self_drop / se_self:.1f}); "
                            f"not explained by holdback drift {ctrl_drop:+.3f} (z={z_did:.1f})")
         if decayed:
-            back = sc.incumbent if (sc.incumbent and sc.incumbent != c) else None
-            if back is None:
-                rates = {o: (data.rate(o, metric) or 0) for o in others}
-                back = max(others, key=lambda o: (rates[o], o))
-            return [{**base, "mode": "explore", "incumbent": back, "champion": back,
+            # Move off the decayed champion to the best holdback arm over the trailing window (the holdback
+            # is exactly the evidence we have about "what works now"); keep a holdback, exclude the decayed arm.
+            # We don't reopen full exploration: that would put 60% of traffic on arms we already measured.
+            # pick on everything since promotion (more data than the 24h trigger window), with rates shrunk
+            # to the pooled holdback mean (50-call prior) so a small lucky arm can't win by noise
+            since = arm_data(self.store, wf.id, sc.dim, "all", sc.mode_since_hb or 0, cohorts=cohorts)
+            tot_s = tot_t = 0
+            for o in others:
+                n_, c_, e_ = since.totals(o)
+                tot_s += e_ if metric == "engagement_rate" else c_
+                tot_t += since.trials(o, metric)
+            mean = tot_s / tot_t if tot_t else 0.0
+            rates = {}
+            for o in others:
+                n_, c_, e_ = since.totals(o)
+                t_ = since.trials(o, metric)
+                rates[o] = shrunk_rate(e_ if metric == "engagement_rate" else c_, t_, mean) if t_ >= 30 else None
+            scored = [o for o in others if rates[o] is not None]
+            if scored:
+                back = max(scored, key=lambda o: (round(rates[o], 6), o))
+            else:
+                back = sc.incumbent if (sc.incumbent and sc.incumbent != c) else others[0]
+            ev["holdback_rates"] = {o: (round(r, 4) if r is not None else None) for o, r in rates.items()}
+            return [{**base, "mode": "exploit", "incumbent": c, "champion": back,
                      "excluded": sorted(set(sc.excluded) | {c}), "rollback": True,
-                     "reason": f"DECAY: {why}; roll back to {back} and re-explore", "evidence": ev}]
-        # a holdback arm that has turned significantly worse than the champion lately: stop exposing it
-        recent = arm_data(self.store, wf.id, sc.dim, "all", hb - S.RECENT_LOSE_H, cohorts=cohorts)
-        bad = [o for o in others if recent.cmp(o, c, metric).n_a >= S.RECENT_MIN_N[metric]
-               and recent.cmp(o, c, metric).z <= -S.Z_LOSE]
-        if bad:
-            return [{**base, "mode": "exploit", "excluded": sorted(set(sc.excluded) | set(bad)),
-                     "reason": f"stop holdback arm(s) {', '.join(bad)}: significantly worse than champion {c} over "
-                               f"the last {S.RECENT_LOSE_H}h", "evidence": {o: recent.cmp(o, c, metric).as_dict()
-                                                                          for o in bad}}]
+                     "reason": f"DECAY: {why}; move to {back} (best holdback arm over the trailing window)",
+                     "evidence": ev}]
         # a holdback arm that has since become significantly better than the champion
         since = arm_data(self.store, wf.id, sc.dim, "all", sc.mode_since_hb or 0, cohorts=cohorts)
         best = None
@@ -471,7 +485,7 @@ class Experiments:
                                        f"expected_{metric}": [round(est[metric][0], 4), round(est[metric][1], 4)],
                                        f"expected_{gm}": [round(est[gm][0], 4), round(est[gm][1], 4)]})
         affected = self.ctl.affected_leads(wf, min(1.0, affected_share or 1.0), hb)
-        promos = [t for t in transitions if t["mode"] == "exploit"]
+        promos = [t for t in transitions if t["mode"] == "exploit" and not t.get("rollback")]
         rollbacks = [t for t in transitions if t.get("rollback")]
         explores = [t for t in transitions if t["mode"] == "explore" and not t.get("rollback")]
         parts = []
@@ -479,7 +493,7 @@ class Experiments:
             where = "" if t["cohort"] == "default" else f" for cohort {t['cohort']}"
             parts.append(f"use {t['dim']} {t['champion']}{where}")
         for t in rollbacks:
-            parts.append(f"roll back {t['dim']} to {t['incumbent']} (decay)")
+            parts.append(f"move {t['dim']} off decaying {t['incumbent']} to {t['champion']}")
         for t in explores:
             if t.get("excluded") and set(t["excluded"]) != set(self._scope_excl(t)):
                 parts.append(f"stop {t['dim']} {','.join(sorted(set(t['excluded']) - set(self._scope_excl(t))))}")

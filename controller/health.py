@@ -146,7 +146,7 @@ class Health:
         intro = dict(self.store.q("SELECT did, introduced_hb FROM dids WHERE wf=? AND introduced_hb IS NOT NULL",
                                   (wf.id,)))
         for did in sorted(d for d in usable if d in intro):  # only DIDs WE brought in are on trial
-            data = arm_data(self.store, wf.id, "caller_id", "all", max(intro[did], hb - S.GUARD_WINDOW_H))
+            data = arm_data(self.store, wf.id, "caller_id", "all", max(intro[did], hb - S.GUARD_WINDOW_H))  # noqa
             others = [o for o in usable if o != did]
             c = data.cmp_vs_pool(did, others, "engagement_rate")
             if c.n_a < S.GUARD_MIN_CONN or c.n_b < S.GUARD_MIN_CONN:
@@ -248,6 +248,9 @@ class Health:
             return  # a supervisor set caller IDs recently: leave routine rotation alone for the pause window
         routine_ok = auto or (look and self.ctl.gov.can_request(wf, urgent=False))
         start_probes = routine_ok and not urgent and not self.store.get(f"guard_freeze:{wf.id}")
+        st0 = self.states(wf.id)
+        if urgent and not any(s == "active" for s, _ in st0.values()):
+            start_probes = True  # the last proven DID is out: replacing it with candidates is part of the fix
         tgt = self.target(wf, start_probes)
         if not tgt:
             return

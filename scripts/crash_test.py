@@ -57,19 +57,33 @@ def main():
     log = []
     t0 = time.time()
     try:
+        end = c.get("/sim/state").json()["end_minute"]
+        # kill 1: wall-clock, lands inside the history ingestion. Kills 2..N: at random SIMULATED times spread
+        # over the whole scenario (plus sub-second jitter so they land mid-tick: during ingest, governance
+        # calls or decisions), so restarts happen around live approvals and incidents.
+        targets = sorted(rng.uniform(0.05, 0.95) * end for _ in range(a.kills - 1))
         for k in range(a.kills):
             p = subprocess.Popen(["./run.sh", url], env=env, stdout=subprocess.DEVNULL,
                                  stderr=open(f"{state_dir}.ctl.log", "a") if os.path.isdir(state_dir) else subprocess.DEVNULL)
-            # first kill lands inside history ingestion; later ones anywhere in the run
-            wait = rng.uniform(4, 9) if k == 0 else rng.uniform(2, 12)
-            time.sleep(wait)
+            if k == 0:
+                time.sleep(rng.uniform(3, 6))
+            else:
+                target = targets[k - 1]
+                while p.poll() is None and c.get("/sim/state").json()["sim_minute"] < target:
+                    time.sleep(0.2)
+                time.sleep(rng.uniform(0, 1.5))  # may land during start-up if the target already passed
             if p.poll() is not None:
                 log.append({"kill": k + 1, "note": "controller had already finished"})
                 break
             st = c.get("/sim/state").json()
             os.kill(p.pid, signal.SIGKILL)
             p.wait()
-            log.append({"kill": k + 1, "after_s": round(wait, 1), "sim_ts": st["ts"], "sim_minute": st["sim_minute"]})
+            sdb = sqlite3.connect(f"file:{state_dir}/{st['scenario']}.sqlite?mode=ro", uri=True)
+            pend = sdb.execute("SELECT status, COUNT(*) FROM proposals WHERE status IN "
+                               "('intent','pending','approved','applying') GROUP BY status").fetchall()
+            sr = sdb.execute("SELECT v FROM meta WHERE k='starts'").fetchone()
+            log.append({"kill": k + 1, "sim_ts": st["ts"], "sim_minute": st["sim_minute"],
+                        "inflight_at_kill": dict(pend), "starts_recorded": json.loads(sr[0]) if sr else 0})
             print("killed", log[-1], flush=True)
         p = subprocess.run(["./run.sh", url], env=env, stdout=subprocess.DEVNULL,
                            stderr=open(f"{state_dir}.ctl.log", "a"))
@@ -115,8 +129,13 @@ def check(c, state_dir, a, log):
                                              "detail": {"ingested": ev[0], "sim_last_event_id": st["last_event_id"],
                                                         "chunks": ev[1]}}
     starts = json.loads(db.execute("SELECT v FROM meta WHERE k='starts'").fetchone()[0])
-    kills = len([x for x in log if "sim_minute" in x])
-    res["7 restarted after every kill"] = {"ok": starts == kills + 1, "detail": {"starts": starts, "kills": kills}}
+    kills = [x for x in log if "sim_minute" in x]
+    seq = [x["starts_recorded"] for x in kills]
+    # a kill can land before the new process records its start (killed during interpreter start-up); what
+    # must hold is that starts never go backwards and the final run started after the last kill
+    ok = seq == sorted(seq) and starts == (seq[-1] if seq else 0) + 1
+    res["7 restarted after every kill"] = {"ok": ok, "detail": {"starts_final": starts, "kills": len(kills),
+                                                                "starts_recorded_at_each_kill": seq}}
     return res
 
 
@@ -125,10 +144,11 @@ def write(a, log, res, wall):
              f"Command: `.venv/bin/python scripts/crash_test.py --scenario {a.scenario} --kills {a.kills} "
              f"--seed {a.seed}`", "",
              "The controller was SIGKILLed (no shutdown hooks) at random wall-clock moments — the first one inside "
-             "the history ingestion — and restarted with the same `./run.sh` each time. Wall time "
-             f"{wall:.0f}s.", "", "## Kills", "", "| # | after (s) | sim time at kill |", "|---|---|---|"]
+             "the history ingestion, the rest at random simulated times across the scenario — and restarted with "
+             f"the same `./run.sh` each time. Wall time {wall:.0f}s.", "", "## Kills", "",
+             "| # | sim time at kill | proposals in flight at the kill (from our store) |", "|---|---|---|"]
     for k in log:
-        lines.append(f"| {k['kill']} | {k.get('after_s', '-')} | {k.get('sim_ts', k.get('note'))} |")
+        lines.append(f"| {k['kill']} | {k.get('sim_ts', k.get('note'))} | {k.get('inflight_at_kill', '')} |")
     lines += ["", "## Invariants", "", "| check | result | detail |", "|---|---|---|"]
     for name, r in res.items():
         lines.append(f"| {name} | {'PASS' if r['ok'] else 'FAIL'} | `{json.dumps(r['detail'], default=str)[:300]}` |")
