@@ -57,7 +57,7 @@ class Governance:
         a, b = wf.approver_hours
         if not (a <= hour < b - S.APPROVAL_SUBMIT_LAST_HOUR_MARGIN):
             return False
-        pref = S.SUPERVISOR_PREFS.get(wf.id)
+        pref = S.supervisor_pref(wf.spec)
         if pref:
             if hour < pref.get("not_before_hour", 0):
                 return False

@@ -71,7 +71,16 @@ REQUEST_RESERVE = 1            # keep one approval request per 24h free for inci
 APPROVAL_SUBMIT_LAST_HOUR_MARGIN = 1  # don't send routine requests in the approver's last hour
 # Stakeholder 04 (Kestrel ops supervisor): <=2 requests/day, never before 11:00. Stricter than the policy
 # (4/24h, 10-19) so we honour it for routine changes; incidents may still use the policy limit.
-SUPERVISOR_PREFS = {"ks_cancel": {"max_requests_per_day": 2, "not_before_hour": 11}}
+# Matched by tenant + a use-case keyword (not a workflow id) so it also binds that line in other scenarios.
+SUPERVISOR_PREFS = [{"tenant": "kestrel_finance", "use_case_contains": "cancel",
+                     "max_requests_per_day": 2, "not_before_hour": 11}]
+
+
+def supervisor_pref(wf_spec: dict) -> dict | None:
+    for p in SUPERVISOR_PREFS:
+        if wf_spec.get("tenant_id") == p["tenant"] and p["use_case_contains"] in (wf_spec.get("use_case") or "").lower():
+            return p
+    return None
 
 
 def z_final(m: int, alpha: float = 0.05) -> float:
