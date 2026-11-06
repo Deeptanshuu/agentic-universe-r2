@@ -280,3 +280,6 @@ class Incidents:
                 prompt = self.ctl.live_config(wf.id)["config"].get("prompt_version")
                 if prompt:
                     self.detect(wf, prompt, hb)
+                    iid, d = self.open_incident(wf.id)
+                    if iid:  # respond in the same tick: every 15 minutes counts toward time-to-fix
+                        self.progress(wf, iid, d, hb)

@@ -86,7 +86,7 @@
     "type": "supervisor_edit",
     "workflow": "ks_cancel",
     "at": "D3 11:30",
-    "mttr_minutes": 180,
+    "mttr_minutes": 165,
     "fixed_by": "controller_approved"
   },
   {
@@ -114,4 +114,4 @@
 }
 ```
 
-Credits used: 4 · validation runs: 1 · LLM fix calls: 0
+Credits used: 6 · validation runs: 1 · LLM fix calls: 0

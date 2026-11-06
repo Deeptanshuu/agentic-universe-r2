@@ -89,7 +89,7 @@ def why(path: str, wf: str, at: str) -> str:
                 out.append(f"- evidence: {json.dumps(b['evidence'], default=str)[:900]}")
     out += ["", "## Decisions that led here (48h before)"]
     for sim_ts, kind, summary in db.q("SELECT sim_ts, kind, summary FROM decisions WHERE wf=? AND hb BETWEEN ? AND ? "
-                                      "AND kind NOT IN ('daily_summary','deferred') ORDER BY id", (wf, vhb - 48, vhb)):
+                                      "AND kind NOT IN ('daily_summary','deferred','look') ORDER BY id", (wf, vhb - 48, vhb)):
         out.append(f"- {sim_ts[5:16]} [{kind}] {summary}")
     out += ["", "## What happened next"]
     before = kpis(_StoreShim(db), wf, vhb - 24, vhb)
@@ -99,7 +99,7 @@ def why(path: str, wf: str, at: str) -> str:
     out.append(f"- 24h after:  pickup {after['pickup_rate']} engagement {after['engagement_rate']} "
                f"flag rate {after['halluc_rate']} (dials {after['dials']})")
     for sim_ts, kind, summary in db.q("SELECT sim_ts, kind, summary FROM decisions WHERE wf=? AND hb > ? AND hb <= ? "
-                                      "AND kind NOT IN ('daily_summary','deferred','experiment_eval') ORDER BY id LIMIT 15",
+                                      "AND kind NOT IN ('daily_summary','deferred','experiment_eval','look') ORDER BY id LIMIT 15",
                                       (wf, vhb, vhb + 48)):
         out.append(f"- {sim_ts[5:16]} [{kind}] {summary}")
     return "\n".join(out)
