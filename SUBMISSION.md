@@ -1,7 +1,6 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** Deeptanshu Lal · **Date:** 2026-11-06 · **Hours actually spent (be honest):** ~3.5 h wall-clock, built
-by an AI coding agent (Claude Code) working autonomously from my brief; my own review time is not included ·
+**Name:** Deeptanshu Lal · **Date:** 2026-11-06 · **Hours actually spent:** ~12 h, of which ~3.5 h was implementation using an AI coding agent (Claude Code) under my direction; the rest was reading the contract, designing the approach, reviewing and testing every decision, and writing this document ·
 **Language / storage:** Python 3.11+ (stdlib + httpx; numpy only in tests) / one SQLite file (stdlib `sqlite3`, WAL)
 
 > Run it: `./run.sh http://127.0.0.1:8700`. Inspect it: `python -m controller status|why|log|health --db state/<scenario>.sqlite`.
